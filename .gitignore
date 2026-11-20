@@ -1,0 +1,6 @@
+# 运行时数据、日志、以及 build-app.sh 的产物不该进仓库
+node_modules/
+*.log
+.DS_Store
+icon.icns
+/tmp/

@@ -1,0 +1,8 @@
+{
+  "name": "hagemi-desktop",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "Hagemi on the desktop: a transparent always-on-top host for the hagemi-pet-agy sidecar.",
+  "main": "main.cjs"
+}
