@@ -146,6 +146,15 @@ macOS 于是把菜单栏的半透明材质改成采样窗口内容，屏幕最�
 **整机闲置久了要停手。** 上面那套「替你补一次鼠标移动」会让她的内部时钟以为你一直在动，
 于是永远不打盹。所以整机十分钟没人碰之后就不再补，正好也是她该睡的时候。
 
+**Antigravity 2.35 之后，token 得由宿主递。** 插件是靠翻 `ps` 找
+`language_server --csrf_token` 拿凭据的；2.35 起 Antigravity 把 token 从命令行挪进了
+子进程环境（免得在 `ps` 里被人看见），于是那条路断了，她每次轮询都报
+`Language server exposes no CSRF token`，额度气泡里多一行「Antigravity 未连接」。
+好在插件本来就认 `ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_CSRF_TOKEN` 两个环境变量，
+而新版本把凭据明文写在 `~/.gemini/antigravity/daemon/hub_<httpPort>.json` 里。
+宿主读这份文件（挑 pid 还活着的那个，端口随重启递增），启动 sidecar 时递过去 ——
+插件一行不用改。Antigravity 再换端口或换 token 时，宿主只重启 sidecar，不动 Antigravity 本身。
+
 ## 已知取舍
 
 - **看不见你打字**。插件原本能感知键盘（只记时间戳，不读键值），那是在 Antigravity 的页面里。
