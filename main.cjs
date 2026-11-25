@@ -70,6 +70,7 @@ let server = null;
 let sidecar = null;
 let quitting = false;
 let restartDelay = 500;
+let startedWith = ''; // sidecar 启动那一刻用的 language server 凭据（端口:token），变了就重启她
 let pointerDown = false;
 let hitBusy = false;
 let ignoring = true;
@@ -288,6 +289,66 @@ async function createWindow() {
 
 // ---- sidecar 监护 -------------------------------------------------------------------
 
+// 插件的 ls-client 只认两个环境变量（ANTIGRAVITY_LS_ADDRESS / ANTIGRAVITY_CSRF_TOKEN），
+// 没有的话就自己去猜：翻 `ps` 找 language_server 的 argv 里的 --csrf_token。
+// Antigravity 2.35 起这条路断了 —— token 从命令行挪进了进程环境，argv 里只剩
+// `--read_host_bridge_token_from_stdin`。于是 sidecar 每次轮询都报
+// 「Language server exposes no CSRF token」，HUD 上就是「Antigravity 未连接」。
+//
+// 新版本换了发牌方式：daemon/hub_<httpPort>.json 里明文写着 pid / 端口 / csrfToken。
+// 宿主替她把这份凭据读出来，按插件本来就支持的方式用环境变量递过去 —— 插件一行不用改。
+const ANTIGRAVITY_HOME = path.join(HOME, '.gemini', 'antigravity');
+const HUB_DIR = path.join(ANTIGRAVITY_HOME, 'daemon');
+
+// 换了 pid 的旧 hub 文件要跳过：只认进程还活着的那个。
+function aliveLanguageServer(pid) {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function readLanguageServer() {
+  let names = [];
+  try { names = fs.readdirSync(HUB_DIR).filter(name => /^hub_.*\.json$/.test(name)); } catch { return null; }
+  let newest = null;
+  for (const name of names) {
+    try {
+      const hub = JSON.parse(fs.readFileSync(path.join(HUB_DIR, name), 'utf8'));
+      if (!hub || !hub.csrfToken || !hub.httpPort) continue;
+      if (!aliveLanguageServer(Number(hub.pid))) continue;
+      const stamp = Number(hub.httpPort); // 端口随重启递增，比文件 mtime 更可靠
+      if (!newest || stamp > newest.stamp) newest = { hub, stamp, name };
+    } catch { /* 文件正在被重写，下一轮再看 */ }
+  }
+  return newest;
+}
+
+function languageServerEnv() {
+  const newest = readLanguageServer();
+  if (!newest) return {};
+  const { hub, name } = newest;
+  log(`language server from ${name}: port ${hub.httpPort}, ls ${hub.lsVersion || '?'}`);
+  return {
+    ANTIGRAVITY_LS_ADDRESS: `127.0.0.1:${hub.httpPort}`,
+    ANTIGRAVITY_CSRF_TOKEN: hub.csrfToken,
+    ...(hub.lsVersion ? { ANTIGRAVITY_LS_VERSION: hub.lsVersion } : {}),
+  };
+}
+
+// Antigravity 每次重启都会换端口、换 token，而环境变量只在 spawn 那一刻生效。
+// 所以盯着这份凭据：一变就把 sidecar 重新拉起来（只拉她，不动 Antigravity）。
+function watchLanguageServer() {
+  setInterval(() => {
+    if (quitting || !sidecar) return;
+    const newest = readLanguageServer();
+    if (!newest) return;
+    const fingerprint = `${newest.hub.httpPort}:${newest.hub.csrfToken}`;
+    if (!startedWith || fingerprint === startedWith) return;
+    log(`language server changed (${startedWith.slice(0, 12)}… → ${fingerprint.slice(0, 12)}…), restarting sidecar`);
+    startedWith = fingerprint;
+    restartSidecar();
+  }, 20000);
+}
+
 function seedSettings() {
   if (fs.existsSync(SETTINGS_FILE)) return;
   let previous = {};
@@ -321,23 +382,30 @@ function startSidecar() {
     ELECTRON_RUN_AS_NODE: '1', // 用 Electron 自带的 node 跑插件，不依赖系统里装没装 node 22
     HAGEMI_PROFILE_DIR: PROFILE_DIR, // 让她去找这个窗口的 DevTools 端口
     ANTIGRAVITY_EXECUTABLE_DATA_DIR: DATA_DIR, // 设置和额度账本放宿主自己的目录
+    ...languageServerEnv(), // Antigravity 2.35 起得由宿主把凭据递过去，见上面的注释
   };
   delete env.NODE_OPTIONS;
   delete env.NODE_USE_ENV_PROXY;
+  // 记下这次用的是哪一套凭据，watcher 靠它判断 Antigravity 有没有换过端口/token。
+  startedWith = env.ANTIGRAVITY_CSRF_TOKEN ? `${env.ANTIGRAVITY_LS_ADDRESS.split(':')[1]}:${env.ANTIGRAVITY_CSRF_TOKEN}` : '';
   const out = fs.openSync(SIDECAR_LOG, 'a');
   fs.writeSync(out, `\n=== sidecar started ${new Date().toISOString()} ===\n`);
-  sidecar = spawn(process.execPath, [SIDECAR], { cwd: path.join(PLUGIN_DIR, 'sidecars', 'pet'), env, stdio: ['ignore', out, out] });
-  log('sidecar pid', sidecar.pid);
-  sidecar.on('exit', (code, signal) => {
+  const child = spawn(process.execPath, [SIDECAR], { cwd: path.join(PLUGIN_DIR, 'sidecars', 'pet'), env, stdio: ['ignore', out, out] });
+  sidecar = child;
+  log('sidecar pid', child.pid);
+  child.on('exit', (code, signal) => {
     log(`sidecar exited code=${code} signal=${signal}`);
-    sidecar = null;
     try { fs.closeSync(out); } catch { /* already closed */ }
+    // 只有「当前这一只」退出才需要再拉一只。restartSidecar() 会先把 sidecar 置空再杀，
+    // 那次退出不该触发第二次 spawn，否则每换一次凭据就多攒一只孤儿。
+    if (sidecar !== child) return;
+    sidecar = null;
     if (quitting) return;
     // 插件自更新会让她自己退出一次，宿主负责把她请回来。
     restartDelay = Math.min(restartDelay * 2, 15000);
     setTimeout(startSidecar, restartDelay);
   });
-  sidecar.on('error', error => log('sidecar spawn failed', error.message));
+  child.on('error', error => log('sidecar spawn failed', error.message));
 }
 
 function restartSidecar() {
@@ -484,6 +552,7 @@ if (cliFlag('autostart') || cliFlag('no-autostart')) {
     await createWindow();
     createTray();
     startSidecar();
+    watchLanguageServer();
     setInterval(tick, TICK_MS);
     screen.on('display-metrics-changed', () => coverDisplay());
     screen.on('display-added', () => coverDisplay());
