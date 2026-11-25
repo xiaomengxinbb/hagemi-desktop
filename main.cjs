@@ -39,6 +39,13 @@ const TICK_MS = 45;
 const FOCUS_WINDOW_MS = 90_000; // 借用键盘焦点的最长时间
 const IDLE_POLL_MS = 400; // 光标不动时，每隔这么久重问一次命中（她会自己走过来）
 const SYNTH_IDLE_LIMIT_S = 600; // 整机闲置超过这么久就不再补鼠标移动，让她能真的睡过去
+// 她的窗口不再「铺满一块屏」，而是一个 900×800 的小盒子 —— 和 dsh 桌宠的窗口同样大。
+// 盒子里是她的整个坐标系：走动、蹦跳、贴边、气泡、菜单、设置面板全在里面。
+// 盒子不会把她关死：拖她的时候盒子跟着光标走（followDrag），她走到哪儿盒子跟到哪儿，
+// 所以整块桌面她照样去得了，只是窗口本身始终只有她周围这一小圈。
+const BOX = { w: 900, h: 800 };
+const DRAG_EDGE = 150; // 光标离盒子边缘多近就把盒子跟过去（拖她的时候用）
+const PROBE_MS = 150; // 多久问她一次「你走到哪儿了」
 
 // 早期版本把数据放在代码目录里，搬家时顺手接过来，别让她忘了自己站在哪儿。
 function adoptLegacyState() {
@@ -80,6 +87,11 @@ let displayId = null; // 她安家在哪块屏
 let lastBounds = null;
 let lastPollAt = 0;
 let overNow = false; // 上一轮轮询里光标是不是在她身上
+let herNow = null; // 最近一次问到的她（盒子内的坐标，px）
+let dragPointer = null; // 拖动途中浏览器报来的指针位置（她的 client 坐标）
+let lastPointerAt = 0; // 最近一次收到指针事件的时间，用来识破「松手松在窗口外面」
+let probing = false;
+let settled = false; // 首次挂上后把她的绝对位置放回去，只做一次
 
 // ---- 点击穿透 -----------------------------------------------------------------------
 //
@@ -124,6 +136,260 @@ function hoverInject(point) {
   setTimeout(() => send(x, y), 16);
 }
 
+// ---- 小窗口里的她 -------------------------------------------------------------------
+//
+// 她整个坐标系都建立在 window.innerWidth/innerHeight 上（pet.js:150 的 viewW/viewH）：
+// 默认站位、走动范围、气泡往哪边翻、菜单往哪边弹，全按窗口算。窗口只有 900×800 之后，
+// 这些计算照样是对的，代价是她的活动范围也只剩这 900×800 —— 所以盒子要会跟着她挪。
+//
+// 挪法：每 150ms 问她一次位置。她贴近盒壁、还想继续往外走时，盒子朝那个方向让开，
+// 让开的同时把她钉在原地（moveBoxKeepingHer）—— 她不会察觉窗口动过，只觉得前面又空出来了。
+
+// 她的 JS 世界是 CDP 建的隔离世界（sidecars/pet/lib/cdp.mjs 里的 createIsolatedWorld，
+// worldName 'hagemi-pet'）：它和主世界共用 DOM，但 `window.__hagemiPet` 只活在那个世界里，
+// 主世界的 executeJavaScript 看不到它（elementFromPoint 倒是能用，因为 DOM 是共用的）。
+// 所以要读位置、要推位置，都得先挂到那个世界上去。
+//
+// 挂在宿主自己的 DevTools 端口上即可：一个 target 允许多个 CDP 会话，sidecar 那条连接不受影响
+// （早先用独立探针脚本同时连着试过很多轮）。
+const PET_WORLD = 'hagemi-pet';
+
+function devtoolsPort() {
+  try {
+    const text = fs.readFileSync(path.join(PROFILE_DIR, 'DevToolsActivePort'), 'utf8');
+    const port = Number(text.split(/\r?\n/)[0]);
+    return Number.isInteger(port) && port > 0 ? port : 0;
+  } catch { return 0; }
+}
+
+let pet = null;      // 与她自己那个世界的会话
+let petOpening = null;
+
+function openPetWorld() {
+  if (pet) return Promise.resolve(pet);
+  if (petOpening) return petOpening;
+  petOpening = (async () => {
+    const port = devtoolsPort();
+    if (!port) throw new Error('no devtools port');
+    const list = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+    const target = list.find(item => item.type === 'page' && /^https?:\/\/(127\.0\.0\.1|localhost)/.test(item.url || ''));
+    if (!target) throw new Error('no page target');
+    const session = await connectPetWorld(target.webSocketDebuggerUrl);
+    pet = session;
+    return session;
+  })().finally(() => { petOpening = null; });
+  return petOpening;
+}
+
+// 一条极简 CDP 会话：只要能发命令、能认出她的世界什么时候建好/销毁。
+function connectPetWorld(url) {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(url);
+    const session = { socket, contextId: null, nextId: 0, pending: new Map(), closed: false };
+    const timer = setTimeout(() => { session.closed = true; try { socket.close(); } catch { /* 已关 */ } reject(new Error('pet world timed out')); }, 5000);
+    session.send = (method, params = {}, timeout = 4000) => new Promise((res, rej) => {
+      if (session.closed || socket.readyState !== 1) return rej(new Error('pet world closed'));
+      const id = ++session.nextId;
+      const guard = setTimeout(() => { session.pending.delete(id); rej(new Error(`${method} timed out`)); }, timeout);
+      session.pending.set(id, { res, rej, guard });
+      socket.send(JSON.stringify({ id, method, params }));
+    });
+    socket.addEventListener('message', event => {
+      let message;
+      try { message = JSON.parse(event.data); } catch { return; }
+      if (message.id) {
+        const item = session.pending.get(message.id);
+        if (!item) return;
+        session.pending.delete(message.id);
+        clearTimeout(item.guard);
+        if (message.error) item.rej(new Error(message.error.message)); else item.res(message.result || {});
+        return;
+      }
+      const { method, params } = message;
+      if (method === 'Runtime.executionContextCreated' && params.context?.name === PET_WORLD) session.contextId = params.context.id;
+      if (method === 'Runtime.executionContextDestroyed' && params.executionContextId === session.contextId) session.contextId = null;
+      if (method === 'Runtime.executionContextsCleared') session.contextId = null;
+    });
+    socket.addEventListener('close', () => {
+      session.closed = true;
+      clearTimeout(timer);
+      for (const item of session.pending.values()) { clearTimeout(item.guard); item.rej(new Error('pet world closed')); }
+      session.pending.clear();
+      if (pet === session) pet = null;
+    });
+    socket.addEventListener('error', () => { clearTimeout(timer); session.closed = true; reject(new Error('pet world failed')); }, { once: true });
+    socket.addEventListener('open', async () => {
+      try {
+        await session.send('Runtime.enable');
+        clearTimeout(timer);
+        resolve(session);
+      } catch (error) { clearTimeout(timer); session.closed = true; reject(error); }
+    }, { once: true });
+  });
+}
+
+// 在那个世界里跑一句。她还没挂上（世界还没建）时返回 null，不抛。
+async function inHerWorld(expression) {
+  let session;
+  try { session = await openPetWorld(); } catch { return null; }
+  if (!session.contextId) return null;
+  try {
+    const result = await session.send('Runtime.evaluate', { expression, contextId: session.contextId, returnByValue: true });
+    if (result.exceptionDetails) return null;
+    return result.result ? result.result.value : null;
+  } catch { return null; }
+}
+
+// 问她在盒子里的坐标（画布中心，px）。读的是插件自己的 API，不碰影子根。
+async function readHer() {
+  const text = await inHerWorld('window.__hagemiPet ? JSON.stringify(window.__hagemiPet.position) : ""');
+  if (!text) return null;
+  try {
+    const her = JSON.parse(text);
+    return Number.isFinite(her.x) && Number.isFinite(her.y) ? her : null;
+  } catch { return null; }
+}
+
+function clamp01(value) {
+  if (!Number.isFinite(value)) return 0.5;
+  return Math.min(0.985, Math.max(0.015, value));
+}
+
+// 把她推到盒子里的某个比例位置。hello 是插件给的正式入口：重算尺寸、重新站位，
+// 状态、动画、气泡一概不动，也不会往 sidecar 报一次「我被拖了」（pet.js:709-715）。
+function pushHer(fraction) {
+  const message = { t: 'hello', settings: { position: { x: clamp01(fraction.x), y: clamp01(fraction.y) } } };
+  inHerWorld(`window.__hagemiPet && window.__hagemiPet.receive(${JSON.stringify(message)}), 0`).catch(() => {});
+}
+
+// 只挪盒子，不碰她。她记的是「窗口比例」，所以盒子一动、她的绝对位置就跟着跑；
+// 想让她的绝对位置不动，得配合 moveBoxKeepingHer 或者随后推一次比例。
+function setBox(x, y) {
+  if (!win || win.isDestroyed()) return false;
+  const box = win.getBounds();
+  const area = preferDisplay().workArea;
+  const next = {
+    x: Math.round(Math.min(Math.max(x, area.x), area.x + area.width - BOX.w)),
+    y: Math.round(Math.min(Math.max(y, area.y), area.y + area.height - BOX.h)),
+    width: BOX.w,
+    height: BOX.h,
+  };
+  if (next.x === box.x && next.y === box.y && next.width === box.width && next.height === box.height) return false;
+  win.setBounds(next);
+  lastBounds = next;
+  writeState({ box: { x: next.x, y: next.y } });
+  return true;
+}
+
+// 挪盒子并把她钉在原地：先记下她在桌面上的绝对坐标，挪完按新盒子反算比例推回去。
+// 「她不动、盒子在动」是这套小窗口方案的核心手感 —— 用户只会看见她周围那圈空气在换地方。
+function moveBoxKeepingHer(x, y) {
+  if (!win || win.isDestroyed() || !herNow) return setBox(x, y);
+  const box = win.getBounds();
+  const absolute = { x: box.x + herNow.x, y: box.y + herNow.y };
+  if (!setBox(x, y)) return false;
+  const after = win.getBounds();
+  // 换屏的时候盒子会一下跳到很远的另一块屏上，她的绝对坐标就落到了盒子外面。
+  // 插件那边 pushHer 会把她夹回盒子里，所以这里也跟着夹一次，账本和画面对得上。
+  const local = {
+    x: Math.min(Math.max(absolute.x - after.x, after.width * 0.02), after.width * 0.98),
+    y: Math.min(Math.max(absolute.y - after.y, after.height * 0.02), after.height * 0.98),
+  };
+  herNow = local;
+  pushHer({ x: local.x / after.width, y: local.y / after.height });
+  return true;
+}
+
+// 每 150ms 问她一次在哪儿，顺手把「她在桌面上的绝对坐标」记到账本里。
+// 记这个是为了下次启动能把她放回原处：窗口换了地方、换了大小时，她不该跟着跳。
+function probeHer() {
+  if (!win || win.isDestroyed() || !win.isVisible() || probing) return;
+  probing = true;
+  readHer().then(her => {
+    probing = false;
+    if (!her || !Number.isFinite(her.x) || !Number.isFinite(her.y)) return;
+    herNow = her;
+    const box = win.getBounds();
+    const at = { x: Math.round(box.x + her.x), y: Math.round(box.y + her.y) };
+    const saved = readState();
+    if (!saved.herAt || Math.abs(saved.herAt.x - at.x) > 6 || Math.abs(saved.herAt.y - at.y) > 6) writeState({ herAt: at });
+    if (!settled) { settled = true; settleHerAtStartup(her); return; }
+    if (pointerDown) followDrag(box);
+    else panWithHer(box, her);
+  }).catch(() => { probing = false; });
+}
+
+// 拖动时盒子跟着光标走。她自己的拖拽是「她跟着光标走」的：clientX 一超出窗口，
+// 她就会被 keepInBounds 钳在边上，手一松还判定成「贴边」—— 小窗口里这手感是坏的。
+// 所以拖动期间把窗口朝光标方向带过去，让 clientX 始终留在窗口中间那片安全区里。
+// 这里绝不能钉住她：她的坐标本来就跟着光标走，盒子一动、clientX 相对变小，
+// 她的绝对位置才不会跑。
+function followDrag(box) {
+  const cursor = screen.getCursorScreenPoint();
+  let localX = cursor.x - box.x, localY = cursor.y - box.y;
+  // 有更好的数据就用它：preload 报来的是浏览器眼里的 clientX，正好是她的坐标系。
+  if (dragPointer) { localX = dragPointer.x; localY = dragPointer.y; }
+  const safeX = Math.min(DRAG_EDGE, Math.round(box.width / 2));
+  const safeY = Math.min(DRAG_EDGE, Math.round(box.height / 2));
+  let dx = 0, dy = 0;
+  if (localX > box.width - safeX) dx = localX - (box.width - safeX);
+  else if (localX < safeX) dx = localX - safeX;
+  if (localY > box.height - safeY) dy = localY - (box.height - safeY);
+  else if (localY < safeY) dy = localY - safeY;
+  if (!dx && !dy) return;
+  // 注意：这里只挪窗口，绝不能顺手把她钉住。
+  // 她记的是「光标在窗口里的位置」，窗口往右挪 dx，光标在窗口里的坐标就小了 dx，
+  // 她自己会往左走 dx —— 绝对位置刚好不动，还是老老实实挂在指头底下。
+  // 要是这里再把她钉一次，两边就会互相较劲，松手时她会偏出去小半个身位。
+  setBox(box.x + dx, box.y + dy);
+  if (dragPointer) { dragPointer = { x: localX - dx, y: localY - dy }; }
+}
+
+// 她走近盒壁时，盒子朝那个方向让开，好让她继续往外走 —— 否则她的活动范围就被永久
+// 锁死在 900×800 里，桌面中间凭空多出一堵看不见的墙。
+//
+// 让开的方式是「钉住她、挪盒子」：盒子往左 6px，她的 client 坐标就往右 6px，
+// 绝对位置一像素都没变，而左边又空出了 6px 可以走。要是不钉住她，
+// 盒子每 150ms 往左挪一点就等于把她一路推着走，她会自己滑到屏幕边上。
+//
+// 贴边（docked）是例外：插件把她钉死在窗口的左/右边缘（pet.js:152），
+// 钉住她就等于让她一直贴着盒子边、盒子一路滑到那块屏的边上 —— 这正是想要的效果。
+const PAN_EDGE = 170;
+const PAN_STEP = 6;
+function panWithHer(box, her) {
+  const area = preferDisplay().workArea;
+  const gapLeft = box.x - area.x;
+  const gapRight = area.x + area.width - (box.x + box.width);
+  const gapTop = box.y - area.y;
+  const gapBottom = area.y + area.height - (box.y + box.height);
+  // 贴边是一步到位：她已经挂在盒壁上了，盒子再慢慢挪 6px 就成了「墙在慢慢退」，
+  // 看上去要好几秒才挪到屏边。这里直接把盒子搬到那块屏的边上，她跟着一起过去。
+  if (her.x <= 0.5) { if (gapLeft > 0) setBox(area.x, box.y); return; }
+  if (her.x >= box.width - 0.5) { if (gapRight > 0) setBox(area.x + area.width - box.width, box.y); return; }
+  if (her.x < PAN_EDGE && gapLeft > 0) { moveBoxKeepingHer(box.x - Math.min(PAN_STEP, PAN_EDGE - her.x, gapLeft), box.y); return; }
+  if (box.width - her.x < PAN_EDGE && gapRight > 0) { moveBoxKeepingHer(box.x + Math.min(PAN_STEP, PAN_EDGE - (box.width - her.x), gapRight), box.y); return; }
+  if (her.y < PAN_EDGE && gapTop > 0) { moveBoxKeepingHer(box.x, box.y - Math.min(PAN_STEP, PAN_EDGE - her.y, gapTop)); return; }
+  if (box.height - her.y < PAN_EDGE && gapBottom > 0) moveBoxKeepingHer(box.x, box.y + Math.min(PAN_STEP, PAN_EDGE - (box.height - her.y), gapBottom));
+}
+
+// 开机第一件事：把她放回上次待的那块桌面位置。
+// 以前窗口铺满整屏，她存的是「占整屏的比例」；现在只有 900×800，直接套用会让她跳到角落。
+// 她的比例没变（窗口 resize 时插件按比例把她带过来了），所以用旧窗口尺寸还原成绝对坐标。
+function settleHerAtStartup(her) {
+  if (!win || win.isDestroyed()) return;
+  const box = win.getBounds();
+  const saved = readState();
+  let at = saved.herAt;
+  if (!at) {
+    // 老宿主铺满整块工作区：用她「占整屏的比例 × 那块屏」还原成绝对坐标，
+    // 再拿它去摆新盒子，看上去她才像原地没动过。
+    const previous = saved.lastBox || preferDisplay().workArea;
+    at = { x: previous.x + (her.x / box.width) * previous.width, y: previous.y + (her.y / box.height) * previous.height };
+  }
+  setBox(at.x - her.x, at.y - her.y);
+  log(`her on desktop at ${Math.round(at.x)},${Math.round(at.y)}; box ${win.getBounds().x},${win.getBounds().y} ${BOX.w}x${BOX.h}`);
+}
+
 // 菜单/面板只认她自己世界里的 pointerdown；合成一个「点在外面」的按下，等于替用户点了下空白。
 function closeHerUi() {
   if (!win || win.isDestroyed()) return;
@@ -147,7 +413,13 @@ async function tick() {
   const cursor = screen.getCursorScreenPoint();
   const moved = cursor.x !== lastCursor.x || cursor.y !== lastCursor.y;
   lastCursor = cursor;
-  if (pointerDown) { setIgnore(false); return; }
+  if (pointerDown) {
+    // 松手松在窗口外面的时候，pointerup 送不到页面，pointerDown 会一直卡着：
+    // 她会停在「被拖住」的姿势，窗口也会跟着最后那个坐标乱跑。超过 1.5 秒没有任何
+    // 指针事件就当手已经松开了。
+    if (Date.now() - lastPointerAt > 1500) { pointerDown = false; dragPointer = null; }
+    else { setIgnore(false); return; }
+  }
   // 光标没动也要偶尔重问一次：她自己在屏幕上走来走去，随时可能走到光标底下；
   // 只跟着光标走的话，她蹭过来时仍然是穿透的，右键菜单就点不出来。
   //
@@ -161,6 +433,13 @@ async function tick() {
   lastPollAt = now;
   const bounds = win.getBounds();
   const point = { x: cursor.x - bounds.x, y: cursor.y - bounds.y };
+  // 窗口只是她周围那 900×800 的一圈，光标绝大多数时候根本不在里面。
+  // 不在里面就一定不在她身上 —— 省掉一次 IPC，也不会误碰她的命中框。
+  if (point.x < 0 || point.y < 0 || point.x >= bounds.width || point.y >= bounds.height) {
+    if (overNow) { overNow = false; setIgnore(true); if (moved) closeHerUi(); }
+    else setIgnore(true);
+    return;
+  }
   hitBusy = true;
   const wasOver = overNow;
   overNow = await overHer(point);
@@ -208,22 +487,26 @@ function startServer() {
   });
 }
 
-// 窗口铺满「工作区」而不是整块屏：菜单栏那 30px 不能盖。
-// 盖住菜单栏的时候，macOS 会把菜单栏的半透明材质改成「采样窗口内容」，
-// 于是菜单栏下沿会出现一条明显的亮/暗分界线——大屏上尤其刺眼。
-// 反正她本来也进不去菜单栏（keepInBounds 会把她推下来），窗口退让 30px 没有损失。
+// 换屏（或显示器参数变了）时，把盒子挪到那块屏上。盒子只有 900×800，
+// 盖不到菜单栏，所以早先那条「菜单栏材质会把窗口内容采样进去、留下一条分割线」的坑
+// 自然就不存在了 —— 窗口再也不会碰到菜单栏那一带。
 function coverDisplay() {
   if (!win || win.isDestroyed()) return;
   const wanted = preferDisplay();
-  const bounds = wanted.workArea;
-  if (lastBounds && lastBounds.x === bounds.x && lastBounds.y === bounds.y && lastBounds.width === bounds.width && lastBounds.height === bounds.height) return;
-  lastBounds = bounds;
-  win.setBounds(bounds);
-  log(`window ${bounds.width}x${bounds.height} @${wanted.scaleFactor}x on display ${wanted.id} (${wanted.label || 'unnamed'}) workArea`);
+  const area = wanted.workArea;
+  const box = win.getBounds();
+  // 尽量待在原来的位置上；放不下就贴到那块屏的右下角（她默认也待在那儿）。
+  const wantedX = box.width === BOX.w && box.x >= area.x && box.x + BOX.w <= area.x + area.width
+    ? box.x : area.x + area.width - BOX.w;
+  const wantedY = box.height === BOX.h && box.y >= area.y && box.y + BOX.h <= area.y + area.height
+    ? box.y : area.y + area.height - BOX.h;
+  if (wantedX === box.x && wantedY === box.y) return; // 盒子已经在这块屏上了，别把她晃一下
+  moveBoxKeepingHer(wantedX, wantedY);
+  log(`window ${BOX.w}x${BOX.h} @${wanted.scaleFactor}x on display ${wanted.id} (${wanted.label || 'unnamed'}) workArea`);
 }
 
 // 她在哪块屏上就留在哪块屏上：默认是主屏（带菜单栏那块，也是用户最常看的一块），
-// 要换屏从托盘里选，选完记住。整窗铺满是为了让她的坐标系和屏幕一致。
+// 要换屏从托盘里选，选完记住。盒子跟着她走，所以换成小窗也不会限制她去哪。
 function preferDisplay() {
   const all = screen.getAllDisplays();
   if (displayId != null) {
@@ -239,8 +522,12 @@ function readState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return {}; }
 }
 
+let stateCache = null;
 function writeState(patch) {
-  try { fs.writeFileSync(STATE_FILE, `${JSON.stringify({ ...readState(), ...patch }, null, 2)}\n`); } catch (error) { log('state write failed', error.message); }
+  // 普惠段每 150ms 就会调一次，没必要每次都读盘：读一次、改一笔，落盘也不频繁。
+  if (!stateCache) stateCache = readState();
+  stateCache = { ...stateCache, ...patch };
+  try { fs.writeFileSync(STATE_FILE, `${JSON.stringify(stateCache, null, 2)}\n`); } catch (error) { log('state write failed', error.message); }
 }
 
 async function createWindow() {
@@ -250,9 +537,13 @@ async function createWindow() {
   const display = preferDisplay();
   displayId = display.id;
   writeState({ displayId });
-  lastBounds = display.workArea;
+  // 盒子放在上次待的地方；第一次跑就贴右下角（她默认也站那儿）。
+  // 老宿主铺满整屏，把那个尺寸记下来：她存的「比例」要按它才能还原成绝对坐标。
+  const box = boxPosition(saved);
+  if (!saved.lastBox) writeState({ lastBox: { x: display.workArea.x, y: display.workArea.y, width: display.workArea.width, height: display.workArea.height } });
+  lastBounds = { x: box.x, y: box.y, width: BOX.w, height: BOX.h };
   win = new BrowserWindow({
-    ...display.workArea,
+    ...lastBounds,
     show: false,
     transparent: true,
     frame: false,
@@ -284,7 +575,18 @@ async function createWindow() {
   win.on('closed', () => { win = null; });
   await win.loadURL(`http://127.0.0.1:${port}/`);
   win.showInactive();
-  log(`window ${display.workArea.width}x${display.workArea.height} @${display.scaleFactor}x, page:${port}`);
+  log(`window ${BOX.w}x${BOX.h} at ${lastBounds.x},${lastBounds.y} @${display.scaleFactor}x, page:${port}`);
+}
+
+// 盒子的初始位置：上次停的地方；从没停过就贴那块屏的右下角。
+function boxPosition(saved) {
+  const area = preferDisplay().workArea;
+  const fit = (x, y) => ({
+    x: Math.round(Math.min(Math.max(x, area.x), area.x + area.width - BOX.w)),
+    y: Math.round(Math.min(Math.max(y, area.y), area.y + area.height - BOX.h)),
+  });
+  if (saved.box && Number.isFinite(saved.box.x) && Number.isFinite(saved.box.y)) return fit(saved.box.x, saved.box.y);
+  return fit(area.x + area.width - BOX.w - 40, area.y + area.height - BOX.h - 40);
 }
 
 // ---- sidecar 监护 -------------------------------------------------------------------
@@ -543,8 +845,17 @@ if (cliFlag('autostart') || cliFlag('no-autostart')) {
   app.quit();
 } else {
   app.on('second-instance', () => { if (win) win.showInactive(); });
-  ipcMain.on('hagemi-desktop:pointer-down', () => { pointerDown = true; grantFocus(); });
-  ipcMain.on('hagemi-desktop:pointer-up', () => { pointerDown = false; });
+  ipcMain.on('hagemi-desktop:pointer-down', () => { pointerDown = true; lastPointerAt = Date.now(); grantFocus(); });
+  ipcMain.on('hagemi-desktop:pointer-up', () => { pointerDown = false; dragPointer = null; lastPointerAt = Date.now(); });
+  // 拖动途中每一帧都跟：等 150ms 的轮询再挪窗口太慢，光标一快就直接出窗，
+  // 出窗之后浏览器不再给她 pointermove，她当场停住——所以这里收到一帧就挪一帧。
+  ipcMain.on('hagemi-desktop:pointer-move', (event, point) => {
+    if (!pointerDown || !point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) return;
+    dragPointer = { x: point.x, y: point.y };
+    lastPointerAt = Date.now();
+    if (!win || win.isDestroyed()) return;
+    followDrag(win.getBounds());
+  });
   ipcMain.on('hagemi-desktop:menu', () => grantFocus());
 
   app.whenReady().then(async () => {
@@ -554,6 +865,9 @@ if (cliFlag('autostart') || cliFlag('no-autostart')) {
     startSidecar();
     watchLanguageServer();
     setInterval(tick, TICK_MS);
+    // 她什么时候挂上是 sidecar 决定的（CDP 一连上她就出现），所以位置这件事只能轮询着等。
+    setInterval(probeHer, PROBE_MS);
+    setInterval(coverDisplay, 5000);
     screen.on('display-metrics-changed', () => coverDisplay());
     screen.on('display-added', () => coverDisplay());
     screen.on('display-removed', () => coverDisplay());
