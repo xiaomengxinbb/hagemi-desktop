@@ -380,6 +380,10 @@ function settleHerAtStartup(her) {
   const box = win.getBounds();
   const saved = readState();
   let at = saved.herAt;
+  // 上次记的位置还得落在这一块屏上；用户从托盘换了屏，或者把显示器拔了，
+  // 那个坐标就跑到屏幕外面去了，这时宁可让她站回盒子的默认位置。
+  const area = preferDisplay().workArea;
+  if (at && (at.x < area.x - 200 || at.y < area.y - 200 || at.x > area.x + area.width + 200 || at.y > area.y + area.height + 200)) at = null;
   if (!at) {
     // 老宿主铺满整块工作区：用她「占整屏的比例 × 那块屏」还原成绝对坐标，
     // 再拿它去摆新盒子，看上去她才像原地没动过。
@@ -778,9 +782,14 @@ ${args}
 function moveToDisplay(id) {
   const found = screen.getAllDisplays().find(d => d.id === id);
   if (!found) return;
+  // 换屏的时候「绝对坐标不变」没有意义：两块屏可能根本不挨着，硬保就会把她顶到盒子角上。
+  // 换屏保的是「她在窗口里的位置比例」，看上去就是整块桌面搬了个家。
+  const box = win && !win.isDestroyed() ? win.getBounds() : null;
+  const fraction = box && herNow ? { x: herNow.x / box.width, y: herNow.y / box.height } : null;
   displayId = found.id;
   writeState({ displayId });
   coverDisplay();
+  if (fraction) pushHer(fraction);
   refreshTray();
 }
 
